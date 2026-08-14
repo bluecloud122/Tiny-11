@@ -93,13 +93,14 @@ try {
         New-ItemProperty -Path $touchpad -Name $entry.Key -Value $entry.Value -PropertyType DWord -Force | Out-Null
     }
 
-    $ubuntu = 'C:\Windows\Setup\Files\Ubuntu.appx'
-    if (Test-Path $ubuntu) {
+    $ubuntuWsl = 'C:\Windows\Setup\Files\Ubuntu.wsl'
+    if (Test-Path $ubuntuWsl) {
         try {
-            Add-AppxPackage -Path $ubuntu -ErrorAction Stop
+            & wsl.exe --install --from-file $ubuntuWsl --no-launch
+            if ($LASTEXITCODE -ne 0) { throw "wsl.exe failed with exit code $LASTEXITCODE" }
             Write-Host 'Ubuntu WSL package installed for the first Windows user.'
         } catch {
-            Write-Warning "Ubuntu package registration did not complete: $($_.Exception.Message)"
+            Write-Warning "Ubuntu WSL package installation did not complete: $($_.Exception.Message)"
         }
     }
 
@@ -170,7 +171,7 @@ try {
     $setupFiles = Join-Path $mount 'Windows\Setup\Files'
     $setupScripts = Join-Path $mount 'Windows\Setup\Scripts'
     New-Item -ItemType Directory -Path $setupFiles, $setupScripts -Force | Out-Null
-    Copy-Item $resolvedUbuntuPackage (Join-Path $setupFiles 'Ubuntu.appx') -Force
+    Copy-Item $resolvedUbuntuPackage (Join-Path $setupFiles 'Ubuntu.wsl') -Force
     Write-FirstLogonScript (Join-Path $setupScripts 'Tiny11CustomFirstLogon.ps1')
 
     $manifest = [ordered]@{
