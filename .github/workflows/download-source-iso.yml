@@ -1,0 +1,73 @@
+name: Download Source Windows ISO
+
+on:
+  workflow_dispatch:
+    inputs:
+      iso_url:
+        description: Direct HTTPS URL of the source Windows ISO
+        required: true
+        default: https://archive.org/download/atom-os-tiny-11-25h2-003/AtomOS%20Tiny11%2025h2%20003%20with%20AnkhTech.iso
+        type: string
+      iso_sha256:
+        description: Optional SHA-256 checksum of the ISO
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  download:
+    name: Download and zip source ISO only
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      ISO_URL: ${{ inputs.iso_url }}
+      ISO_SHA256: ${{ inputs.iso_sha256 }}
+    steps:
+      - name: Download source ISO with curl
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p build
+          curl --fail --silent --show-error --location \
+            --retry 5 --retry-all-errors --connect-timeout 30 \
+            --output build/source-windows.iso \
+            "$ISO_URL"
+
+          node <<'NODE_INNER'
+          const fs = require('node:fs');
+          const crypto = require('node:crypto');
+          const path = 'build/source-windows.iso';
+          const stat = fs.statSync(path);
+          if (stat.size < 100 * 1024 * 1024) {
+            throw new Error('Downloaded file is unexpectedly small: ' + stat.size + ' bytes');
+          }
+          const hash = crypto.createHash('sha256');
+          hash.update(fs.readFileSync(path));
+          const sha256 = hash.digest('hex');
+          const expected = process.env.ISO_SHA256.trim().toLowerCase();
+          console.log(JSON.stringify({ file: path, bytes: stat.size, sha256, checksumVerified: expected ? expected === sha256 : false }));
+          if (expected && expected !== sha256) {
+            throw new Error('SHA-256 mismatch: expected ' + expected + ', received ' + sha256);
+          }
+          NODE_INNER
+
+      - name: Zip source ISO
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          zip -9 -j build/tiny11-source-iso.zip build/source-windows.iso
+          unzip -t build/tiny11-source-iso.zip
+          rm build/source-windows.iso
+          ls -lh build/tiny11-source-iso.zip
+
+      - name: Upload ZIP artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tiny11-source-iso-zip
+          path: build/tiny11-source-iso.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
