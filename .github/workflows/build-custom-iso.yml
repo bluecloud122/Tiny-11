@@ -14,9 +14,9 @@ on:
         default: '1'
         type: string
       ubuntu_url:
-        description: Official Ubuntu WSL package URL
+        description: Direct HTTPS URL of an Ubuntu WSL .wsl package
         required: true
-        default: https://aka.ms/wslubuntu2404
+        default: https://releases.ubuntu.com/24.04.4/ubuntu-24.04.4-wsl-amd64.wsl
         type: string
       boot_timeout_seconds:
         description: Seconds to wait while testing the rebuilt ISO
@@ -78,22 +78,22 @@ jobs:
           } else {
             Write-Host 'ISO cache hit; reusing cached source ISO.'
           }
-          if (-not (Test-Path build/cache/ubuntu/Ubuntu.appx)) {
+          if (-not (Test-Path build/cache/ubuntu/Ubuntu.wsl)) {
             Write-Host 'Ubuntu cache miss; downloading Ubuntu WSL package.'
-            curl.exe --fail --silent --show-error --location --retry 5 --retry-all-errors --connect-timeout 30 "$env:UBUNTU_URL" --output build/cache/ubuntu/Ubuntu.appx
+            curl.exe --fail --silent --show-error --location --retry 5 --retry-all-errors --connect-timeout 30 "$env:UBUNTU_URL" --output build/cache/ubuntu/Ubuntu.wsl
           } else {
             Write-Host 'Ubuntu cache hit; reusing cached Ubuntu WSL package.'
           }
           Copy-Item build/cache/iso/input.iso build/input.iso -Force
-          Copy-Item build/cache/ubuntu/Ubuntu.appx build/Ubuntu.appx -Force
+          Copy-Item build/cache/ubuntu/Ubuntu.wsl build/Ubuntu.wsl -Force
           curl.exe --fail --silent --show-error --location "https://raw.githubusercontent.com/bluecloud122/Tiny-11/${{ github.sha }}/scripts/build-custom-windows.ps1" --output build/build-custom-windows.ps1
-          node -e "const fs=require('fs'); for (const p of ['build/input.iso','build/Ubuntu.appx','build/build-custom-windows.ps1']) { const s=fs.statSync(p).size; console.log(p+': '+s+' bytes'); if (s < 100) process.exit(1); }"
+          node -e "const fs=require('fs'); for (const p of ['build/input.iso','build/Ubuntu.wsl','build/build-custom-windows.ps1']) { const s=fs.statSync(p).size; console.log(p+': '+s+' bytes'); if (s < 100) process.exit(1); }"
 
       - name: Customize and rebuild ISO
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          pwsh -NoLogo -NoProfile -ExecutionPolicy Bypass -File build/build-custom-windows.ps1 -InputIso build/input.iso -UbuntuPackage build/Ubuntu.appx -ImageIndex ([int]$env:IMAGE_INDEX) -OutputRoot build/output
+          pwsh -NoLogo -NoProfile -ExecutionPolicy Bypass -File build/build-custom-windows.ps1 -InputIso build/input.iso -UbuntuPackage build/Ubuntu.wsl -ImageIndex ([int]$env:IMAGE_INDEX) -OutputRoot build/output
 
       - name: Upload rebuilt ISO and reports
         if: always()
