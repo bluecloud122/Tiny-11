@@ -695,7 +695,24 @@ jobs:
           fi
 
           # This is a disposable virtual disk, never a physical runner disk.
-          truncate -s 8G "${ventoy_disk}"
+          # Size it from the ISO instead of reserving a fixed 8 GiB. Initializing
+          # the fixed-size image can exhaust the runner filesystem before the ISO
+          # is copied, even when the ISO itself is much smaller.
+          iso_bytes="$(stat --format='%s' "${ISO_PATH}")"
+          ventoy_disk_bytes="$(node -e '
+            const isoBytes = Number(process.argv[1]);
+            const gib = 1024 ** 3;
+            const safetyBytes = 512 * 1024 * 1024;
+            const minimumBytes = 2 * gib;
+            const requiredBytes = isoBytes + safetyBytes;
+            const sizeBytes = Math.max(
+              minimumBytes,
+              Math.ceil(requiredBytes / gib) * gib,
+            );
+            process.stdout.write(String(sizeBytes));
+          ' "${iso_bytes}")"
+          echo "Creating Ventoy disk: ${ventoy_disk_bytes} bytes for ISO: ${iso_bytes} bytes"
+          truncate -s "${ventoy_disk_bytes}" "${ventoy_disk}"
           loopdev="$(sudo losetup --find --show --partscan "${ventoy_disk}")"
           # Ventoy asks for two confirmations even with -I. Feed only those
           # confirmations, then reattach the loop device so Linux rereads the
@@ -715,6 +732,11 @@ jobs:
           fi
           data_partition="${partitions[2]}"
           sudo mount "${data_partition}" "${ventoy_mount}"
+          available_bytes="$(df --output=avail -B1 "${ventoy_mount}" | tail -n 1 | tr -d '[:space:]')"
+          if (( available_bytes < iso_bytes )); then
+            echo "Ventoy data partition is too small: available=${available_bytes} ISO=${iso_bytes}" >&2
+            exit 1
+          fi
           sudo cp "${ISO_PATH}" "${ventoy_mount}/AtomOS-Tiny11-25H2-003.iso"
           sudo sync
           sudo umount "${ventoy_mount}"
