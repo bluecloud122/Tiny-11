@@ -1,0 +1,524 @@
+name: Inspect ISO for Legacy BIOS
+
+on:
+  workflow_dispatch:
+    inputs:
+      iso_url:
+        description: "Direct HTTPS URL of the ISO to inspect"
+        required: true
+        default: "https://archive.org/download/atom-os-tiny-11-25h2-003/AtomOS%20Tiny11%2025h2%20003%20with%20AnkhTech.iso"
+        type: string
+      iso_sha256:
+        description: "Optional SHA-256 checksum of the ISO (recommended)"
+        required: false
+        default: ""
+        type: string
+      boot_timeout_seconds:
+        description: "How long to let the ISO boot in SeaBIOS"
+        required: true
+        default: "75"
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: inspect-legacy-bios
+  cancel-in-progress: false
+
+jobs:
+  inspect:
+    name: Inspect ISO El Torito and Legacy BIOS boot
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      ISO_URL: ${{ inputs.iso_url }}
+      ISO_SHA256: ${{ inputs.iso_sha256 }}
+      BOOT_TIMEOUT_SECONDS: ${{ inputs.boot_timeout_seconds }}
+      GITHUB_PERSONAL_ACCESS_TOKEN: ${{ secrets.GITHUB_PERSONAL_ACCESS_TOKEN }}
+
+    steps:
+      # This workflow intentionally does not use actions/checkout or git clone.
+      - name: Install inspection tools
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            qemu-system-x86 \
+            seabios \
+            socat \
+            tesseract-ocr
+          mkdir -p reports
+
+      - name: Read reference repository metadata with curl
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          auth_args=()
+          if [[ -n "${GITHUB_PERSONAL_ACCESS_TOKEN:-}" ]]; then
+            auth_args=(-H "Authorization: Bearer ${GITHUB_PERSONAL_ACCESS_TOKEN}")
+          fi
+
+          if ! curl --fail --silent --show-error --location \
+              --retry 4 --retry-all-errors \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "${auth_args[@]}" \
+              "https://api.github.com/repos/bluecloud122/tiny11builder/commits/legacy" \
+              --output reports/tiny11builder-reference.json; then
+            # The repository is public, so an expired or unavailable optional
+            # token must not prevent the ISO inspection itself from running.
+            echo "Authenticated reference lookup failed; retrying public lookup."
+            curl --fail --silent --show-error --location \
+              --retry 4 --retry-all-errors \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "https://api.github.com/repos/bluecloud122/tiny11builder/commits/legacy" \
+              --output reports/tiny11builder-reference.json
+          fi
+
+          node <<'NODE'
+          const fs = require("node:fs");
+
+          const reference = JSON.parse(
+            fs.readFileSync("reports/tiny11builder-reference.json", "utf8"),
+          );
+          const summary = {
+            repository: reference.html_url
+              ? "bluecloud122/tiny11builder"
+              : "reference lookup failed",
+            branch: "legacy",
+            commit: reference.sha ?? null,
+            commitUrl: reference.html_url ?? null,
+            subject: reference.commit?.message?.split("\n", 1)[0] ?? null,
+          };
+
+          fs.writeFileSync(
+            "reports/tiny11builder-reference-summary.json",
+            JSON.stringify(summary, null, 2) + "\n",
+          );
+          console.log(`Reference branch: ${summary.branch}`);
+          console.log(`Reference commit: ${summary.commit ?? "unknown"}`);
+          console.log(`Reference subject: ${summary.subject ?? "unknown"}`);
+          NODE
+
+      - name: Download ISO with curl
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          if [[ "${ISO_URL}" != https://* ]]; then
+            echo "Refusing to download a non-HTTPS ISO URL." >&2
+            exit 1
+          fi
+
+          ISO_PATH="${RUNNER_TEMP}/input.iso"
+          echo "Downloading ISO from ${ISO_URL%%\?*}"
+          curl --fail --silent --show-error --location \
+            --retry 5 --retry-all-errors \
+            --connect-timeout 30 \
+            --continue-at - \
+            "${ISO_URL}" \
+            --output "${ISO_PATH}"
+
+          printf 'ISO_PATH=%s\n' "${ISO_PATH}" >> "${GITHUB_ENV}"
+          printf 'ISO_URL=%s\n' "${ISO_URL}" >> reports/input.txt
+          stat --printf='ISO_BYTES=%s\n' "${ISO_PATH}" | tee -a reports/input.txt
+          sha256sum "${ISO_PATH}" | tee reports/downloaded-sha256.txt
+
+      - name: Verify optional ISO checksum
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          expected="$(printf '%s' "${ISO_SHA256}" | tr -d '[:space:]' | tr '[:lower:]' '[:upper:]')"
+          if [[ -z "${expected}" ]]; then
+            echo "No ISO_SHA256 was supplied; continuing without checksum verification."
+            echo "CHECKSUM=SKIPPED (no checksum supplied)" >> reports/input.txt
+            exit 0
+          fi
+
+          if [[ ! "${expected}" =~ ^[A-F0-9]{64}$ ]]; then
+            echo "iso_sha256 must contain exactly 64 hexadecimal characters." >&2
+            exit 1
+          fi
+
+          actual="$(sha256sum "${ISO_PATH}" | awk '{print toupper($1)}')"
+          if [[ "${actual}" != "${expected}" ]]; then
+            echo "ISO SHA-256 mismatch." >&2
+            echo "Expected: ${expected}" >&2
+            echo "Actual:   ${actual}" >&2
+            exit 1
+          fi
+
+          echo "CHECKSUM=PASS ${actual}" | tee -a reports/input.txt
+
+      - name: Inspect ISO9660 and El Torito structures with Node.js
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          node <<'NODE'
+          const fs = require("node:fs");
+
+          const isoPath = process.env.ISO_PATH;
+          const sectorSize = 2048;
+          const fd = fs.openSync(isoPath, "r");
+          const fileSize = fs.fstatSync(fd).size;
+
+          function readAt(offset, length) {
+            const buffer = Buffer.alloc(length);
+            const bytesRead = fs.readSync(fd, buffer, 0, length, offset);
+            if (bytesRead !== length) {
+              throw new Error(
+                `Could not read ${length} bytes at offset ${offset}; got ${bytesRead}`,
+              );
+            }
+            return buffer;
+          }
+
+          function u16le(buffer, offset) {
+            return buffer.readUInt16LE(offset);
+          }
+
+          function u32le(buffer, offset) {
+            return buffer.readUInt32LE(offset);
+          }
+
+          function ascii(buffer, start, end) {
+            return buffer.toString("ascii", start, end).replace(/\0+$/, "").trim();
+          }
+
+          function hex(buffer) {
+            return buffer.toString("hex").match(/../g)?.join(" ") ?? "";
+          }
+
+          const checks = [];
+          const warnings = [];
+          const result = {
+            isoPath,
+            fileSize,
+            sectorSize,
+            checks,
+            warnings,
+            legacyBiosCapable: false,
+          };
+
+          function addCheck(id, passed, message, details = {}) {
+            checks.push({ id, passed, message, details });
+          }
+
+          try {
+            const pvd = readAt(16 * sectorSize, sectorSize);
+            const pvdIsIso9660 =
+              pvd[0] === 1 && ascii(pvd, 1, 6) === "CD001" && pvd[6] === 1;
+            addCheck(
+              "iso9660-primary-volume-descriptor",
+              pvdIsIso9660,
+              pvdIsIso9660
+                ? "ISO9660 primary volume descriptor is valid."
+                : "ISO9660 primary volume descriptor is missing or invalid.",
+              {
+                systemIdentifier: ascii(pvd, 8, 40),
+                volumeIdentifier: ascii(pvd, 40, 72),
+              },
+            );
+
+            const bootRecord = readAt(17 * sectorSize, sectorSize);
+            const bootRecordIsElTorito =
+              bootRecord[0] === 0 &&
+              ascii(bootRecord, 1, 6) === "CD001" &&
+              bootRecord[6] === 1 &&
+              ascii(bootRecord, 7, 39).toUpperCase().includes("EL TORITO");
+            const catalogLba = bootRecordIsElTorito
+              ? u32le(bootRecord, 71)
+              : null;
+
+            addCheck(
+              "el-torito-boot-record",
+              bootRecordIsElTorito,
+              bootRecordIsElTorito
+                ? `El Torito boot record found; catalog LBA is ${catalogLba}.`
+                : "El Torito boot record was not found.",
+              {
+                bootSystemIdentifier: ascii(bootRecord, 7, 39),
+                catalogLba,
+              },
+            );
+
+            let biosEntryPassed = false;
+            if (bootRecordIsElTorito && catalogLba !== null) {
+              const catalog = readAt(catalogLba * sectorSize, sectorSize);
+              const validation = catalog.subarray(0, 32);
+              let checksum = 0;
+              for (let offset = 0; offset < 32; offset += 2) {
+                checksum = (checksum + u16le(validation, offset)) & 0xffff;
+              }
+
+              const validationEntryPassed =
+                validation[0] === 0x01 &&
+                validation[30] === 0x55 &&
+                validation[31] === 0xaa &&
+                checksum === 0;
+              const platformId = validation[1];
+              const platformName =
+                {
+                  0: "80x86",
+                  1: "PowerPC",
+                  2: "Mac",
+                  0xef: "EFI",
+                }[platformId] ?? `0x${platformId.toString(16)}`;
+
+              const defaultEntry = catalog.subarray(32, 64);
+              const bootIndicator = defaultEntry[0];
+              const mediaType = defaultEntry[1];
+              const mediaName =
+                {
+                  0: "no emulation",
+                  1: "1.2 MiB floppy",
+                  2: "1.44 MiB floppy",
+                  3: "2.88 MiB floppy",
+                  4: "hard disk",
+                }[mediaType] ?? `unknown (0x${mediaType.toString(16)})`;
+              const bootLba = u32le(defaultEntry, 8);
+              const sectorCount = u16le(defaultEntry, 6);
+              biosEntryPassed =
+                validationEntryPassed &&
+                platformId === 0 &&
+                bootIndicator === 0x88 &&
+                bootLba > 0 &&
+                bootLba * sectorSize < fileSize;
+
+              addCheck(
+                "el-torito-validation-entry",
+                validationEntryPassed,
+                validationEntryPassed
+                  ? "El Torito validation entry has a valid signature and checksum."
+                  : "El Torito validation entry is invalid.",
+                {
+                  platform: platformName,
+                  checksum,
+                  signature: hex(validation.subarray(30, 32)),
+                },
+              );
+              addCheck(
+                "el-torito-bios-entry",
+                biosEntryPassed,
+                biosEntryPassed
+                  ? `A bootable 80x86 BIOS entry points to LBA ${bootLba}.`
+                  : "No valid bootable 80x86 BIOS entry was found.",
+                {
+                  bootIndicator: `0x${bootIndicator.toString(16)}`,
+                  mediaType: mediaName,
+                  loadSegment: `0x${u16le(defaultEntry, 2).toString(16)}`,
+                  systemType: `0x${defaultEntry[4].toString(16)}`,
+                  sectorCount,
+                  bootLba,
+                },
+              );
+            } else {
+              addCheck(
+                "el-torito-bios-entry",
+                false,
+                "Cannot inspect the BIOS boot entry without an El Torito catalog.",
+              );
+            }
+
+            const mbr = readAt(0, 512);
+            const mbrSignature = mbr[510] === 0x55 && mbr[511] === 0xaa;
+            const partitions = [];
+            for (let index = 0; index < 4; index += 1) {
+              const offset = 446 + index * 16;
+              const type = mbr[offset + 4];
+              const lbaStart = mbr.readUInt32LE(offset + 8);
+              const sectors = mbr.readUInt32LE(offset + 12);
+              if (type !== 0 || lbaStart !== 0 || sectors !== 0) {
+                partitions.push({
+                  index: index + 1,
+                  bootable: mbr[offset] === 0x80,
+                  type: `0x${type.toString(16).padStart(2, "0")}`,
+                  lbaStart,
+                  sectors,
+                });
+              }
+            }
+            addCheck(
+              "hybrid-mbr",
+              mbrSignature,
+              mbrSignature
+                ? "An MBR signature is present in the ISO system area."
+                : "No MBR signature is present in the ISO system area.",
+              { partitions },
+            );
+            if (!mbrSignature) {
+              warnings.push(
+                "An MBR is useful for hybrid USB media, but it is not required for El Torito CD/DVD boot.",
+              );
+            }
+
+            result.legacyBiosCapable =
+              pvdIsIso9660 && bootRecordIsElTorito && biosEntryPassed;
+          } catch (error) {
+            addCheck(
+              "parser",
+              false,
+              `Node.js parser error: ${error.message}`,
+            );
+          } finally {
+            fs.closeSync(fd);
+          }
+
+          result.recommendation = result.legacyBiosCapable
+            ? "The ISO contains the structures required for Legacy BIOS El Torito boot. The QEMU SeaBIOS smoke test is the next confirmation."
+            : "The ISO does not pass the deterministic Legacy BIOS structure checks.";
+
+          fs.writeFileSync(
+            "reports/iso-analysis.json",
+            JSON.stringify(result, null, 2) + "\n",
+          );
+
+          const markdown = [
+            "# Legacy BIOS ISO inspection",
+            "",
+            `- ISO size: ${fileSize} bytes`,
+            `- Deterministic Legacy BIOS structure result: **${result.legacyBiosCapable ? "PASS" : "FAIL"}**`,
+            "",
+            "## Checks",
+            ...checks.map(
+              (check) =>
+                `- ${check.passed ? "PASS" : "FAIL"} — ${check.message}`,
+            ),
+            "",
+            "## Warnings",
+            ...(warnings.length > 0
+              ? warnings.map((warning) => `- ${warning}`)
+              : ["- None"]),
+            "",
+            "## Interpretation",
+            "",
+            result.recommendation,
+            "",
+            "A passing El Torito check does not guarantee that the image will install or run on a particular laptop. CPU mode, RAM, storage controller, graphics, network, and Windows driver compatibility still need to be tested on the target hardware.",
+            "",
+          ].join("\n");
+          fs.writeFileSync("reports/iso-analysis.md", markdown);
+
+          console.log(markdown);
+          if (!result.legacyBiosCapable) process.exitCode = 1;
+          NODE
+
+      - name: Boot-test ISO with Legacy BIOS SeaBIOS
+        if: always()
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          if [[ -z "${ISO_PATH:-}" || ! -f "${ISO_PATH}" ]]; then
+            echo "ISO was not downloaded; skipping QEMU." | tee reports/qemu-summary.txt
+            exit 0
+          fi
+
+          bios="$(find /usr/share/seabios /usr/share/qemu -type f -name 'bios.bin' -print -quit 2>/dev/null || true)"
+          if [[ -z "${bios}" ]]; then
+            echo "SeaBIOS firmware was not found." | tee reports/qemu-summary.txt
+            exit 1
+          fi
+
+          monitor="${RUNNER_TEMP}/qemu-monitor.sock"
+          qemu_log="${GITHUB_WORKSPACE}/reports/qemu-console.log"
+          serial_log="${GITHUB_WORKSPACE}/reports/qemu-serial.log"
+          screenshot="${GITHUB_WORKSPACE}/reports/legacy-bios-screen.ppm"
+          ocr="${GITHUB_WORKSPACE}/reports/legacy-bios-screen.txt"
+
+          cleanup() {
+            if [[ -n "${qemu_pid:-}" ]] && kill -0 "${qemu_pid}" 2>/dev/null; then
+              printf 'quit\n' | socat - "UNIX-CONNECT:${monitor}" >/dev/null 2>&1 || true
+              kill "${qemu_pid}" 2>/dev/null || true
+              wait "${qemu_pid}" 2>/dev/null || true
+            fi
+          }
+          trap cleanup EXIT
+
+          qemu-system-x86_64 \
+            -name legacy-bios-iso-inspection \
+            -machine pc \
+            -bios "${bios}" \
+            -cpu qemu64 \
+            -m 2048 \
+            -smp 2 \
+            -cdrom "${ISO_PATH}" \
+            -boot order=d,menu=off,strict=on \
+            -display none \
+            -monitor "unix:${monitor},server,nowait" \
+            -serial "file:${serial_log}" \
+            -no-reboot \
+            > "${qemu_log}" 2>&1 &
+          qemu_pid=$!
+
+          monitor_ready=false
+          for _ in $(seq 1 30); do
+            if [[ -S "${monitor}" ]]; then
+              monitor_ready=true
+              break
+            fi
+            if ! kill -0 "${qemu_pid}" 2>/dev/null; then
+              echo "QEMU exited before its monitor became ready." | tee reports/qemu-summary.txt
+              exit 1
+            fi
+            sleep 1
+          done
+          if [[ "${monitor_ready}" != true ]]; then
+            echo "QEMU monitor did not become ready." | tee reports/qemu-summary.txt
+            exit 1
+          fi
+
+          timeout_seconds="${BOOT_TIMEOUT_SECONDS:-75}"
+          if ! [[ "${timeout_seconds}" =~ ^[0-9]+$ ]] || (( timeout_seconds < 15 || timeout_seconds > 300 )); then
+            echo "boot_timeout_seconds must be between 15 and 300." >&2
+            exit 1
+          fi
+
+          sleep "${timeout_seconds}"
+          if ! kill -0 "${qemu_pid}" 2>/dev/null; then
+            echo "QEMU exited before the BIOS boot smoke test completed." | tee reports/qemu-summary.txt
+            exit 1
+          fi
+
+          printf 'screendump %s\n' "${screenshot}" \
+            | socat - "UNIX-CONNECT:${monitor}" >/dev/null
+          if [[ ! -s "${screenshot}" ]]; then
+            echo "SeaBIOS did not produce a screen capture." | tee reports/qemu-summary.txt
+            exit 1
+          fi
+
+          # OCR is evidence only; the deterministic ISO parser above is the
+          # authoritative structure check. Boot-failure text makes the smoke
+          # test fail, while a normal Windows/Setup screen strengthens it.
+          tesseract "${screenshot}" "${ocr%.txt}" 2>/dev/null || true
+          if grep -Eiq \
+            'no bootable|boot failed|operating system not found|invalid system disk|non-system disk' \
+            "${ocr}"; then
+            echo "SeaBIOS displayed a boot failure:" | tee reports/qemu-summary.txt
+            cat "${ocr}" | tee -a reports/qemu-summary.txt
+            exit 1
+          fi
+
+          {
+            echo "PASS — QEMU remained alive for ${timeout_seconds}s using SeaBIOS."
+            echo "The captured screen did not contain a known BIOS boot-failure message."
+            echo
+            echo "OCR output:"
+            cat "${ocr}" || true
+            echo
+            echo "This is a BIOS boot smoke test, not proof of full installation or hardware compatibility."
+          } | tee reports/qemu-summary.txt
+
+      - name: Upload inspection reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: legacy-bios-iso-inspection
+          path: reports
+          if-no-files-found: warn
+          retention-days: 14
