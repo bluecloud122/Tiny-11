@@ -1,0 +1,119 @@
+name: Build Offline Custom Windows ISO
+
+on:
+  workflow_dispatch:
+    inputs:
+      iso_url:
+        description: Direct HTTPS URL of the source Windows ISO
+        required: true
+        default: https://archive.org/download/atom-os-tiny-11-25h2-003/AtomOS%20Tiny11%2025h2%20003%20with%20AnkhTech.iso
+        type: string
+      image_index:
+        description: Windows image index inside install.wim/install.esd
+        required: true
+        default: '1'
+        type: string
+      ubuntu_url:
+        description: Official Ubuntu WSL package URL
+        required: true
+        default: https://aka.ms/wslubuntu2404
+        type: string
+      boot_timeout_seconds:
+        description: Seconds to wait while testing the rebuilt ISO
+        required: true
+        default: '60'
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2025
+    timeout-minutes: 120
+    env:
+      ISO_URL: ${{ inputs.iso_url }}
+      IMAGE_INDEX: ${{ inputs.image_index }}
+      UBUNTU_URL: ${{ inputs.ubuntu_url }}
+    steps:
+      - name: Install Windows ADK deployment tools
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          choco install windows-adk -y --no-progress
+
+      - name: Download source ISO, Ubuntu package, and build script with curl
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Path build -Force | Out-Null
+          curl.exe --fail --silent --show-error --location --retry 5 --retry-all-errors --connect-timeout 30 "$env:ISO_URL" --output build/input.iso
+          curl.exe --fail --silent --show-error --location --retry 5 --retry-all-errors --connect-timeout 30 "$env:UBUNTU_URL" --output build/Ubuntu.appx
+          curl.exe --fail --silent --show-error --location "https://raw.githubusercontent.com/bluecloud122/Tiny-11/${{ github.sha }}/scripts/build-custom-windows.ps1" --output build/build-custom-windows.ps1
+          node -e "const fs=require('fs'); for (const p of ['build/input.iso','build/Ubuntu.appx','build/build-custom-windows.ps1']) { const s=fs.statSync(p).size; console.log(p+': '+s+' bytes'); if (s < 100) process.exit(1); }"
+
+      - name: Customize and rebuild ISO
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          pwsh -NoLogo -NoProfile -ExecutionPolicy Bypass -File build/build-custom-windows.ps1 -InputIso build/input.iso -UbuntuPackage build/Ubuntu.appx -ImageIndex ([int]$env:IMAGE_INDEX) -OutputRoot build/output
+
+      - name: Upload rebuilt ISO and reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tiny11-custom-offline-iso
+          path: build/output
+          if-no-files-found: warn
+          retention-days: 14
+
+  test:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Download rebuilt ISO
+        uses: actions/download-artifact@v4
+        with:
+          name: tiny11-custom-offline-iso
+          path: build
+
+      - name: Install BIOS test tools
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y qemu-system-x86 seabios socat imagemagick
+
+      - name: Boot rebuilt ISO on fifth-generation CPU profile
+        shell: bash
+        env:
+          BOOT_TIMEOUT_SECONDS: ${{ inputs.boot_timeout_seconds }}
+        run: |
+          set -Eeuo pipefail
+          iso="$(find build -type f -name '*.iso' -print -quit)"
+          [[ -n "$iso" ]] || { echo 'Rebuilt ISO was not found.' >&2; exit 1; }
+          bios="$(find /usr/share/seabios /usr/share/qemu -type f -name bios.bin -print -quit)"
+          monitor="$RUNNER_TEMP/custom-monitor.sock"
+          serial="$RUNNER_TEMP/custom-serial.log"
+          ppm="$RUNNER_TEMP/custom-boot.ppm"
+          png="build/custom-boot.png"
+          qemu-system-x86_64 -name tiny11-custom-broadwell -machine pc -bios "$bios" -cpu Broadwell -m 2048 -smp 2 -cdrom "$iso" -boot order=d,menu=off,strict=on -display none -monitor "unix:$monitor,server,nowait" -serial "file:$serial" -no-reboot -no-shutdown &
+          qemu_pid=$!
+          trap 'kill "$qemu_pid" 2>/dev/null || true' EXIT
+          for _ in $(seq 1 30); do [[ -S "$monitor" ]] && break; sleep 2; done
+          [[ -S "$monitor" ]] || { echo 'QEMU monitor did not start.' >&2; exit 1; }
+          sleep "$BOOT_TIMEOUT_SECONDS"
+          timeout 15s bash -c "printf 'screendump %s\n' '$ppm' | socat - UNIX-CONNECT:$monitor" || true
+          [[ -s "$ppm" ]] || { echo 'QEMU did not produce a boot screenshot.' >&2; exit 1; }
+          convert "$ppm" "$png"
+          printf '{\n  "cpuProfile": "Broadwell (5th-generation Intel Core i5-class)",\n  "bootScreenshot": "%s",\n  "iso": "%s"\n}\n' "$png" "$iso" > build/boot-test.json
+
+      - name: Upload boot test evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tiny11-custom-boot-test
+          path: build
+          if-no-files-found: warn
+          retention-days: 14
