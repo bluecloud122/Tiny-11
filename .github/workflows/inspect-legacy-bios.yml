@@ -551,7 +551,9 @@ jobs:
               fi
 
               if kill -0 "${qemu_pid}" 2>/dev/null; then
-                timeout 10s bash -c "printf 'system_reset\n' | socat - \"UNIX-CONNECT:${monitor}\"" >/dev/null 2>&1 || true
+                # Ctrl+Alt+Delete exercises the guest/BIOS reboot path more
+                # realistically than a QEMU-internal hard reset.
+                timeout 10s bash -c "printf 'sendkey ctrl-alt-delete\n' | socat - \"UNIX-CONNECT:${monitor}\"" >/dev/null 2>&1 || true
                 sleep "${restart_seconds}"
                 if kill -0 "${qemu_pid}" 2>/dev/null &&
                   capture_screen "${monitor}" "${prefix}-restart"; then
@@ -695,8 +697,14 @@ jobs:
           # This is a disposable virtual disk, never a physical runner disk.
           truncate -s 8G "${ventoy_disk}"
           loopdev="$(sudo losetup --find --show --partscan "${ventoy_disk}")"
-          sudo sh "${ventoy_script}" -I "${loopdev}"
+          # Ventoy asks for two confirmations even with -I. Feed only those
+          # confirmations, then reattach the loop device so Linux rereads the
+          # partition table written by Ventoy.
+          printf 'y\ny\n' | sudo sh "${ventoy_script}" -I "${loopdev}"
+          sudo losetup -d "${loopdev}"
+          loopdev="$(sudo losetup --find --show --partscan "${ventoy_disk}")"
           sudo partprobe "${loopdev}" || true
+          sudo udevadm settle || true
           sleep 3
 
           mapfile -t partitions < <(lsblk -lnpo NAME "${loopdev}")
@@ -790,7 +798,7 @@ jobs:
           fi
 
           if kill -0 "${ventoy_pid}" 2>/dev/null; then
-            timeout 10s bash -c "printf 'system_reset\n' | socat - \"UNIX-CONNECT:${ventoy_monitor}\"" >/dev/null 2>&1 || true
+            timeout 10s bash -c "printf 'sendkey ctrl-alt-delete\n' | socat - \"UNIX-CONNECT:${ventoy_monitor}\"" >/dev/null 2>&1 || true
             sleep 15
             capture_ventoy_screen "restart-menu" || true
             timeout 10s bash -c "printf 'sendkey ret\n' | socat - \"UNIX-CONNECT:${ventoy_monitor}\"" >/dev/null 2>&1 || true
