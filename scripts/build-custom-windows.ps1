@@ -39,7 +39,7 @@ function Enable-OptionalOfflineFeature {
     $arguments = @(
         "/Image:$ImagePath",
         "/Enable-Feature",
-        '/FeatureName:$FeatureName',
+        "/FeatureName:$FeatureName",
         "/All",
         "/LimitAccess"
     )
@@ -48,7 +48,11 @@ function Enable-OptionalOfflineFeature {
     $exitCode = $LASTEXITCODE
     $output | ForEach-Object { Write-Host $_ }
     if ($exitCode -eq 0) { return $true }
-    $hexCode = "{0:X8}" -f ([uint32]$exitCode)
+    $exitCodeUInt32 = [BitConverter]::ToUInt32(
+        [BitConverter]::GetBytes([int32]$exitCode),
+        0
+    )
+    $hexCode = "{0:X8}" -f $exitCodeUInt32
     if ($hexCode -eq "800F080C") {
         Write-Warning "Feature $FeatureName is not present in the source image; continuing without it."
         return $false
