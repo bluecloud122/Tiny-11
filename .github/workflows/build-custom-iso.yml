@@ -42,13 +42,50 @@ jobs:
           $ErrorActionPreference = 'Stop'
           choco install windows-adk -y --no-progress
 
-      - name: Download source ISO, Ubuntu package, and build script with curl
+      - name: Prepare cache keys with Node.js
+        id: cache-keys
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Path build/cache/iso, build/cache/ubuntu -Force | Out-Null
+          $isoKey = node -e "const crypto=require('node:crypto'); process.stdout.write(crypto.createHash('sha256').update(process.argv[1]).digest('hex').slice(0,24))" "$env:ISO_URL"
+          $ubuntuKey = node -e "const crypto=require('node:crypto'); process.stdout.write(crypto.createHash('sha256').update(process.argv[1]).digest('hex').slice(0,24))" "$env:UBUNTU_URL"
+          "iso=$isoKey" >> $env:GITHUB_OUTPUT
+          "ubuntu=$ubuntuKey" >> $env:GITHUB_OUTPUT
+          Write-Host "ISO cache key: $isoKey"
+          Write-Host "Ubuntu cache key: $ubuntuKey"
+
+      - name: Cache source ISO
+        uses: actions/cache@v4
+        with:
+          path: build/cache/iso
+          key: ${{ runner.os }}-tiny11-iso-${{ steps.cache-keys.outputs.iso }}
+
+      - name: Cache Ubuntu WSL package
+        uses: actions/cache@v4
+        with:
+          path: build/cache/ubuntu
+          key: ${{ runner.os }}-tiny11-ubuntu-${{ steps.cache-keys.outputs.ubuntu }}
+
+      - name: Download missing source files and build script with curl
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           New-Item -ItemType Directory -Path build -Force | Out-Null
-          curl.exe --fail --silent --show-error --location --retry 5 --retry-all-errors --connect-timeout 30 "$env:ISO_URL" --output build/input.iso
-          curl.exe --fail --silent --show-error --location --retry 5 --retry-all-errors --connect-timeout 30 "$env:UBUNTU_URL" --output build/Ubuntu.appx
+          if (-not (Test-Path build/cache/iso/input.iso)) {
+            Write-Host 'ISO cache miss; downloading source ISO.'
+            curl.exe --fail --silent --show-error --location --retry 5 --retry-all-errors --connect-timeout 30 "$env:ISO_URL" --output build/cache/iso/input.iso
+          } else {
+            Write-Host 'ISO cache hit; reusing cached source ISO.'
+          }
+          if (-not (Test-Path build/cache/ubuntu/Ubuntu.appx)) {
+            Write-Host 'Ubuntu cache miss; downloading Ubuntu WSL package.'
+            curl.exe --fail --silent --show-error --location --retry 5 --retry-all-errors --connect-timeout 30 "$env:UBUNTU_URL" --output build/cache/ubuntu/Ubuntu.appx
+          } else {
+            Write-Host 'Ubuntu cache hit; reusing cached Ubuntu WSL package.'
+          }
+          Copy-Item build/cache/iso/input.iso build/input.iso -Force
+          Copy-Item build/cache/ubuntu/Ubuntu.appx build/Ubuntu.appx -Force
           curl.exe --fail --silent --show-error --location "https://raw.githubusercontent.com/bluecloud122/Tiny-11/${{ github.sha }}/scripts/build-custom-windows.ps1" --output build/build-custom-windows.ps1
           node -e "const fs=require('fs'); for (const p of ['build/input.iso','build/Ubuntu.appx','build/build-custom-windows.ps1']) { const s=fs.statSync(p).size; console.log(p+': '+s+' bytes'); if (s < 100) process.exit(1); }"
 
