@@ -30,6 +30,31 @@ function Invoke-Native {
     }
 }
 
+function Enable-OptionalOfflineFeature {
+    param(
+        [Parameter(Mandatory = $true)][string]$ImagePath,
+        [Parameter(Mandatory = $true)][string]$FeatureName
+    )
+
+    $arguments = @(
+        "/Image:$ImagePath",
+        "/Enable-Feature",
+        '/FeatureName:$FeatureName',
+        "/All",
+        "/LimitAccess"
+    )
+    Write-Host ("> dism.exe " + ($arguments -join " "))
+    $output = & dism.exe @arguments 2>&1
+    $exitCode = $LASTEXITCODE
+    $output | ForEach-Object { Write-Host $_ }
+    if ($exitCode -eq 0) { return $true }
+    $hexCode = "{0:X8}" -f ([uint32]$exitCode)
+    if ($hexCode -eq "800F080C") {
+        Write-Warning "Feature $FeatureName is not present in the source image; continuing without it."
+        return $false
+    }
+    throw "dism.exe failed enabling $FeatureName with exit code $exitCode"
+}
 function Set-OfflineRegistryDword {
     param(
         [Parameter(Mandatory = $true)][string]$HiveName,
@@ -164,9 +189,13 @@ try {
     Invoke-Native 'dism.exe' @('/Mount-Image', "/ImageFile:$wim", "/Index:$selectedIndex", "/MountDir:$mount")
     $imageMounted = $true
 
-    Write-Host 'Enabling WSL2 components.'
-    Invoke-Native 'dism.exe' @("/Image:$mount", '/Enable-Feature', '/FeatureName:Microsoft-Windows-Subsystem-Linux', '/All', '/LimitAccess')
-    Invoke-Native 'dism.exe' @("/Image:$mount", '/Enable-Feature', '/FeatureName:VirtualMachinePlatform', '/All', '/LimitAccess')
+    Write-Host 'Enabling WSL2 components when the source image contains them.'
+    $wslFeaturesAvailable = $true
+    if (-not (Enable-OptionalOfflineFeature -ImagePath $mount -FeatureName 'Microsoft-Windows-Subsystem-Linux')) { $wslFeaturesAvailable = $false }
+    if (-not (Enable-OptionalOfflineFeature -ImagePath $mount -FeatureName 'VirtualMachinePlatform')) { $wslFeaturesAvailable = $false }
+    if (-not $wslFeaturesAvailable) {
+        Write-Warning 'The source image does not contain all WSL2 feature payloads; the staged Ubuntu package will require a Windows image with WSL enabled.'
+    }
 
     $setupFiles = Join-Path $mount 'Windows\Setup\Files'
     $setupScripts = Join-Path $mount 'Windows\Setup\Scripts'
@@ -176,7 +205,7 @@ try {
 
     $manifest = [ordered]@{
         product = 'Tiny11 custom offline foundation'
-        wsl = 'WSL2 with Ubuntu package staged for first logon'
+        wsl = "WSL2 feature enable attempted; missing feature payloads are left disabled"
         automaticWindowsUpdate = 'disabled by policy; Microsoft Store, Defender, and activation services left enabled'
         touchpad = 'Precision Touchpad gesture defaults enabled; hardware driver support still required'
         office = 'not included in this feasibility build'
