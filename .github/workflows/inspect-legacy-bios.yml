@@ -14,7 +14,12 @@ on:
         default: ""
         type: string
       boot_timeout_seconds:
-        description: "How long to let the ISO boot in SeaBIOS"
+        description: "How long to wait after the first BIOS boot"
+        required: true
+        default: "75"
+        type: string
+      restart_wait_seconds:
+        description: "How long to wait after the virtual machine reset"
         required: true
         default: "75"
         type: string
@@ -35,6 +40,7 @@ jobs:
       ISO_URL: ${{ inputs.iso_url }}
       ISO_SHA256: ${{ inputs.iso_sha256 }}
       BOOT_TIMEOUT_SECONDS: ${{ inputs.boot_timeout_seconds }}
+      RESTART_WAIT_SECONDS: ${{ inputs.restart_wait_seconds }}
       GITHUB_PERSONAL_ACCESS_TOKEN: ${{ secrets.GITHUB_PERSONAL_ACCESS_TOKEN }}
 
     steps:
@@ -48,6 +54,7 @@ jobs:
             qemu-system-x86 \
             seabios \
             socat \
+            imagemagick \
             tesseract-ocr
           mkdir -p reports
 
@@ -408,7 +415,7 @@ jobs:
           if (!result.legacyBiosCapable) process.exitCode = 1;
           NODE
 
-      - name: Boot-test ISO with Legacy BIOS SeaBIOS
+      - name: Boot, capture images, reset, and boot again on old CPU profiles
         if: always()
         shell: bash
         run: |
@@ -425,94 +432,198 @@ jobs:
             exit 1
           fi
 
-          monitor="${RUNNER_TEMP}/qemu-monitor.sock"
-          qemu_log="${GITHUB_WORKSPACE}/reports/qemu-console.log"
-          serial_log="${GITHUB_WORKSPACE}/reports/qemu-serial.log"
-          screenshot="${GITHUB_WORKSPACE}/reports/legacy-bios-screen.ppm"
-          ocr="${GITHUB_WORKSPACE}/reports/legacy-bios-screen.txt"
-
-          cleanup() {
-            if [[ -n "${qemu_pid:-}" ]] && kill -0 "${qemu_pid}" 2>/dev/null; then
-              printf 'quit\n' | socat - "UNIX-CONNECT:${monitor}" >/dev/null 2>&1 || true
-              kill "${qemu_pid}" 2>/dev/null || true
-              wait "${qemu_pid}" 2>/dev/null || true
-            fi
-          }
-          trap cleanup EXIT
-
-          qemu-system-x86_64 \
-            -name legacy-bios-iso-inspection \
-            -machine pc \
-            -bios "${bios}" \
-            -cpu qemu64 \
-            -m 2048 \
-            -smp 2 \
-            -cdrom "${ISO_PATH}" \
-            -boot order=d,menu=off,strict=on \
-            -display none \
-            -monitor "unix:${monitor},server,nowait" \
-            -serial "file:${serial_log}" \
-            -no-reboot \
-            > "${qemu_log}" 2>&1 &
-          qemu_pid=$!
-
-          monitor_ready=false
-          for _ in $(seq 1 30); do
-            if [[ -S "${monitor}" ]]; then
-              monitor_ready=true
-              break
-            fi
-            if ! kill -0 "${qemu_pid}" 2>/dev/null; then
-              echo "QEMU exited before its monitor became ready." | tee reports/qemu-summary.txt
-              exit 1
-            fi
-            sleep 1
-          done
-          if [[ "${monitor_ready}" != true ]]; then
-            echo "QEMU monitor did not become ready." | tee reports/qemu-summary.txt
-            exit 1
-          fi
-
-          timeout_seconds="${BOOT_TIMEOUT_SECONDS:-75}"
-          if ! [[ "${timeout_seconds}" =~ ^[0-9]+$ ]] || (( timeout_seconds < 15 || timeout_seconds > 300 )); then
+          boot_seconds="${BOOT_TIMEOUT_SECONDS:-75}"
+          restart_seconds="${RESTART_WAIT_SECONDS:-75}"
+          if ! [[ "${boot_seconds}" =~ ^[0-9]+$ ]] || (( boot_seconds < 15 || boot_seconds > 300 )); then
             echo "boot_timeout_seconds must be between 15 and 300." >&2
             exit 1
           fi
-
-          sleep "${timeout_seconds}"
-          if ! kill -0 "${qemu_pid}" 2>/dev/null; then
-            echo "QEMU exited before the BIOS boot smoke test completed." | tee reports/qemu-summary.txt
+          if ! [[ "${restart_seconds}" =~ ^[0-9]+$ ]] || (( restart_seconds < 15 || restart_seconds > 300 )); then
+            echo "restart_wait_seconds must be between 15 and 300." >&2
             exit 1
           fi
 
-          printf 'screendump %s\n' "${screenshot}" \
-            | socat - "UNIX-CONNECT:${monitor}" >/dev/null
-          if [[ ! -s "${screenshot}" ]]; then
-            echo "SeaBIOS did not produce a screen capture." | tee reports/qemu-summary.txt
-            exit 1
-          fi
+          mkdir -p reports/cpu-profiles
+          : > reports/cpu-results.tsv
+          overall_status=0
 
-          # OCR is evidence only; the deterministic ISO parser above is the
-          # authoritative structure check. Boot-failure text makes the smoke
-          # test fail, while a normal Windows/Setup screen strengthens it.
-          tesseract "${screenshot}" "${ocr%.txt}" 2>/dev/null || true
-          if grep -Eiq \
-            'no bootable|boot failed|operating system not found|invalid system disk|non-system disk' \
-            "${ocr}"; then
-            echo "SeaBIOS displayed a boot failure:" | tee reports/qemu-summary.txt
-            cat "${ocr}" | tee -a reports/qemu-summary.txt
-            exit 1
-          fi
+          # Broadwell is the QEMU profile closest to a 5th-generation Intel
+          # Core i5. The additional profiles check progressively older x64 CPUs.
+          cpu_profiles=(
+            "Broadwell|5th-generation Intel Core i5-class"
+            "Haswell|4th-generation Intel Core i5-class"
+            "IvyBridge|3rd-generation Intel Core i5-class"
+            "SandyBridge|2nd-generation Intel Core i5-class"
+          )
 
-          {
-            echo "PASS — QEMU remained alive for ${timeout_seconds}s using SeaBIOS."
-            echo "The captured screen did not contain a known BIOS boot-failure message."
-            echo
-            echo "OCR output:"
-            cat "${ocr}" || true
-            echo
-            echo "This is a BIOS boot smoke test, not proof of full installation or hardware compatibility."
-          } | tee reports/qemu-summary.txt
+          capture_screen() {
+            local monitor="$1"
+            local prefix="$2"
+            local ppm="${prefix}.ppm"
+            local png="${prefix}.png"
+            local ocr_base="${prefix}"
+            local ocr="${prefix}.txt"
+
+            rm -f "${ppm}" "${png}" "${ocr}"
+            if ! timeout 15s bash -c "printf 'screendump %s\n' \"${ppm}\" | socat - \"UNIX-CONNECT:${monitor}\"" >/dev/null 2>&1; then
+              return 1
+            fi
+            [[ -s "${ppm}" ]] || return 1
+            convert "${ppm}" "${png}"
+            rm -f "${ppm}"
+            tesseract "${png}" "${ocr_base}" 2>/dev/null || true
+            [[ -s "${png}" ]]
+          }
+
+          has_boot_failure() {
+            local ocr="$1"
+            grep -Eiq \
+              'no bootable|boot failed|operating system not found|invalid system disk|non-system disk|not a bootable disk' \
+              "${ocr}"
+          }
+
+          has_os_evidence() {
+            local ocr="$1"
+            grep -Eiq 'loading|windows|setup|project atom|ankh tech|ankhtech' "${ocr}"
+          }
+
+          for profile in "${cpu_profiles[@]}"; do
+            cpu="${profile%%|*}"
+            description="${profile#*|}"
+            safe_cpu="$(printf '%s' "${cpu}" | tr '[:upper:]' '[:lower:]')"
+            prefix="reports/cpu-profiles/${safe_cpu}"
+            monitor="${RUNNER_TEMP}/qemu-${safe_cpu}.sock"
+            qemu_log="${prefix}.qemu-console.log"
+            serial_log="${prefix}.qemu-serial.log"
+            boot_ocr="${prefix}-boot.txt"
+            restart_ocr="${prefix}-restart.txt"
+            qemu_pid=''
+            boot_ok=0
+            restart_ok=0
+            boot_evidence=0
+            restart_evidence=0
+
+            rm -f "${monitor}"
+            echo "=== Testing ${cpu}: ${description} ==="
+            qemu-system-x86_64 \
+              -name "legacy-bios-${safe_cpu}" \
+              -machine pc \
+              -bios "${bios}" \
+              -cpu "${cpu}" \
+              -m 2048 \
+              -smp 2 \
+              -cdrom "${ISO_PATH}" \
+              -boot order=d,menu=off,strict=on \
+              -display none \
+              -monitor "unix:${monitor},server,nowait" \
+              -serial "file:${serial_log}" \
+              -no-reboot \
+              > "${qemu_log}" 2>&1 &
+            qemu_pid=$!
+
+            monitor_ready=false
+            for _ in $(seq 1 30); do
+              if [[ -S "${monitor}" ]]; then
+                monitor_ready=true
+                break
+              fi
+              if ! kill -0 "${qemu_pid}" 2>/dev/null; then
+                break
+              fi
+              sleep 1
+            done
+
+            if [[ "${monitor_ready}" == true ]]; then
+              sleep "${boot_seconds}"
+              if kill -0 "${qemu_pid}" 2>/dev/null &&
+                capture_screen "${monitor}" "${prefix}-boot"; then
+                boot_ok=1
+                [[ -s "${boot_ocr}" ]] && has_boot_failure "${boot_ocr}" && boot_ok=0
+                [[ -s "${boot_ocr}" ]] && has_os_evidence "${boot_ocr}" && boot_evidence=1
+              fi
+
+              if kill -0 "${qemu_pid}" 2>/dev/null; then
+                timeout 10s bash -c "printf 'system_reset\n' | socat - \"UNIX-CONNECT:${monitor}\"" >/dev/null 2>&1 || true
+                sleep "${restart_seconds}"
+                if kill -0 "${qemu_pid}" 2>/dev/null &&
+                  capture_screen "${monitor}" "${prefix}-restart"; then
+                  restart_ok=1
+                  [[ -s "${restart_ocr}" ]] && has_boot_failure "${restart_ocr}" && restart_ok=0
+                  [[ -s "${restart_ocr}" ]] && has_os_evidence "${restart_ocr}" && restart_evidence=1
+                fi
+              fi
+            fi
+
+            if [[ -n "${qemu_pid}" ]] && kill -0 "${qemu_pid}" 2>/dev/null; then
+              timeout 10s bash -c "printf 'quit\n' | socat - \"UNIX-CONNECT:${monitor}\"" >/dev/null 2>&1 || true
+              kill "${qemu_pid}" 2>/dev/null || true
+              wait "${qemu_pid}" 2>/dev/null || true
+            fi
+
+            printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+              "${cpu}" "${description}" "${boot_ok}" "${restart_ok}" \
+              "${boot_evidence}" "${restart_evidence}" \
+              >> reports/cpu-results.tsv
+
+            if (( boot_ok == 0 || restart_ok == 0 )); then
+              overall_status=1
+            fi
+          done
+
+          node <<'NODE'
+          const fs = require("node:fs");
+          const rows = fs
+            .readFileSync("reports/cpu-results.tsv", "utf8")
+            .trim()
+            .split("\n")
+            .filter(Boolean)
+            .map((line) => {
+              const [cpu, description, boot, restart, bootEvidence, restartEvidence] =
+                line.split("\t");
+              return {
+                cpu,
+                description,
+                bootPassed: boot === "1",
+                restartPassed: restart === "1",
+                bootScreenEvidence: bootEvidence === "1",
+                restartScreenEvidence: restartEvidence === "1",
+              };
+            });
+          const result = {
+            test: "Legacy BIOS ISO boot and reset on old Intel CPU profiles",
+            note: "The reset test restarts the ISO boot chain. It does not install Windows to a virtual disk or prove an installed Windows desktop restart.",
+            processors: rows,
+            allBootsPassed: rows.every((row) => row.bootPassed),
+            allRestartsPassed: rows.every((row) => row.restartPassed),
+          };
+          fs.writeFileSync(
+            "reports/cpu-results.json",
+            JSON.stringify(result, null, 2) + "\n",
+          );
+          fs.writeFileSync(
+            "reports/cpu-results.md",
+            [
+              "# Old CPU Legacy BIOS boot and reset test",
+              "",
+              result.note,
+              "",
+              "| CPU profile | First boot | After reset | First-screen OS text | Restart-screen OS text |",
+              "| --- | --- | --- | --- | --- |",
+              ...rows.map(
+                (row) =>
+                  `| ${row.cpu} — ${row.description} | ${row.bootPassed ? "PASS" : "FAIL"} | ${row.restartPassed ? "PASS" : "FAIL"} | ${row.bootScreenEvidence ? "yes" : "no"} | ${row.restartScreenEvidence ? "yes" : "no"} |`,
+              ),
+              "",
+              `All first boots: **${result.allBootsPassed ? "PASS" : "FAIL"}**`,
+              `All reset boots: **${result.allRestartsPassed ? "PASS" : "FAIL"}**`,
+              "",
+            ].join("\n"),
+          );
+          console.log(JSON.stringify(result, null, 2));
+          NODE
+
+          cat reports/cpu-results.md | tee reports/qemu-summary.txt
+          exit "${overall_status}"
 
       - name: Upload inspection reports
         if: always()
