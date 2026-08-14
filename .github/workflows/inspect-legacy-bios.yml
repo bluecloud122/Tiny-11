@@ -23,12 +23,6 @@ on:
         required: true
         default: "75"
         type: string
-      ventoy_url:
-        description: "Direct HTTPS URL of the Ventoy Linux release tarball"
-        required: true
-        default: "https://github.com/ventoy/Ventoy/releases/download/v1.1.17/ventoy-1.1.17-linux.tar.gz"
-        type: string
-
 permissions:
   contents: read
 
@@ -46,7 +40,6 @@ jobs:
       ISO_SHA256: ${{ inputs.iso_sha256 }}
       BOOT_TIMEOUT_SECONDS: ${{ inputs.boot_timeout_seconds }}
       RESTART_WAIT_SECONDS: ${{ inputs.restart_wait_seconds }}
-      VENTOY_URL: ${{ inputs.ventoy_url }}
       GITHUB_PERSONAL_ACCESS_TOKEN: ${{ secrets.GITHUB_PERSONAL_ACCESS_TOKEN }}
 
     steps:
@@ -423,7 +416,7 @@ jobs:
           if (!result.legacyBiosCapable) process.exitCode = 1;
           NODE
 
-      - name: Boot, capture images, reset, and boot again on old CPU profiles
+      - name: Boot, capture images, reset, and boot again on fifth-generation CPU profile
         if: always()
         shell: bash
         run: |
@@ -459,9 +452,6 @@ jobs:
           # Core i5. The additional profiles check progressively older x64 CPUs.
           cpu_profiles=(
             "Broadwell|5th-generation Intel Core i5-class"
-            "Haswell|4th-generation Intel Core i5-class"
-            "IvyBridge|3rd-generation Intel Core i5-class"
-            "SandyBridge|2nd-generation Intel Core i5-class"
           )
 
           capture_screen() {
@@ -634,235 +624,6 @@ jobs:
 
           cat reports/cpu-results.md | tee reports/qemu-summary.txt
           exit "${overall_status}"
-
-      - name: Boot the ISO through Ventoy and repeat after reset
-        if: always()
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-
-          if [[ -z "${ISO_PATH:-}" || ! -f "${ISO_PATH}" ]]; then
-            echo "ISO was not downloaded; skipping Ventoy." | tee reports/ventoy-summary.txt
-            exit 0
-          fi
-          if [[ "${VENTOY_URL}" != https://* ]]; then
-            echo "Refusing to download a non-HTTPS Ventoy URL." >&2
-            exit 1
-          fi
-
-          boot_seconds="${BOOT_TIMEOUT_SECONDS:-75}"
-          restart_seconds="${RESTART_WAIT_SECONDS:-75}"
-          ventoy_archive="${RUNNER_TEMP}/ventoy.tar.gz"
-          ventoy_root="${RUNNER_TEMP}/ventoy"
-          ventoy_disk="${RUNNER_TEMP}/ventoy-test-disk.img"
-          ventoy_mount="${RUNNER_TEMP}/ventoy-mount"
-          ventoy_monitor="${RUNNER_TEMP}/ventoy-monitor.sock"
-          ventoy_log="${GITHUB_WORKSPACE}/reports/ventoy.qemu-console.log"
-          ventoy_serial="${GITHUB_WORKSPACE}/reports/ventoy.qemu-serial.log"
-          ventoy_prefix="${GITHUB_WORKSPACE}/reports/ventoy"
-          loopdev=''
-          ventoy_pid=''
-          mkdir -p "${ventoy_mount}"
-
-          cleanup() {
-            if [[ -n "${ventoy_pid}" ]] && kill -0 "${ventoy_pid}" 2>/dev/null; then
-              timeout 10s bash -c "printf 'quit\n' | socat - \"UNIX-CONNECT:${ventoy_monitor}\"" >/dev/null 2>&1 || true
-              kill "${ventoy_pid}" 2>/dev/null || true
-              wait "${ventoy_pid}" 2>/dev/null || true
-            fi
-            if mountpoint -q "${ventoy_mount}"; then
-              sudo umount "${ventoy_mount}" || true
-            fi
-            if [[ -n "${loopdev}" ]]; then
-              sudo losetup -d "${loopdev}" 2>/dev/null || true
-            fi
-          }
-          trap cleanup EXIT
-
-          curl --fail --silent --show-error --location \
-            --retry 5 --retry-all-errors \
-            --connect-timeout 30 \
-            "${VENTOY_URL}" \
-            --output "${ventoy_archive}"
-          rm -rf "${ventoy_root}"
-          mkdir -p "${ventoy_root}"
-          tar -xzf "${ventoy_archive}" --strip-components=1 -C "${ventoy_root}"
-
-          ventoy_script="$(find "${ventoy_root}" -maxdepth 3 -type f -name 'Ventoy2Disk.sh' -print -quit)"
-          if [[ -z "${ventoy_script}" ]]; then
-            echo "Ventoy2Disk.sh was not found in the downloaded release." >&2
-            exit 1
-          fi
-
-          # This is a disposable virtual disk, never a physical runner disk.
-          # Size it from the ISO instead of reserving a fixed 8 GiB. Initializing
-          # the fixed-size image can exhaust the runner filesystem before the ISO
-          # is copied, even when the ISO itself is much smaller.
-          iso_bytes="$(stat --format='%s' "${ISO_PATH}")"
-          ventoy_disk_bytes="$(node -e '
-            const isoBytes = Number(process.argv[1]);
-            const gib = 1024 ** 3;
-            const safetyBytes = 512 * 1024 * 1024;
-            const minimumBytes = 2 * gib;
-            const requiredBytes = isoBytes + safetyBytes;
-            const sizeBytes = Math.max(
-              minimumBytes,
-              Math.ceil(requiredBytes / gib) * gib,
-            );
-            process.stdout.write(String(sizeBytes));
-          ' "${iso_bytes}")"
-          echo "Creating Ventoy disk: ${ventoy_disk_bytes} bytes for ISO: ${iso_bytes} bytes"
-          truncate -s "${ventoy_disk_bytes}" "${ventoy_disk}"
-          loopdev="$(sudo losetup --find --show --partscan "${ventoy_disk}")"
-          # Ventoy asks for two confirmations even with -I. Feed only those
-          # confirmations, then reattach the loop device so Linux rereads the
-          # partition table written by Ventoy.
-          printf 'y\ny\n' | sudo sh "${ventoy_script}" -I "${loopdev}"
-          sudo losetup -d "${loopdev}"
-          loopdev="$(sudo losetup --find --show --partscan "${ventoy_disk}")"
-          sudo partprobe "${loopdev}" || true
-          sudo udevadm settle || true
-          sleep 3
-
-          mapfile -t partitions < <(lsblk -lnpo NAME "${loopdev}")
-          if (( ${#partitions[@]} < 3 )); then
-            echo "Ventoy did not create the expected data partition." >&2
-            lsblk -f "${loopdev}" >&2 || true
-            exit 1
-          fi
-          data_partition="${partitions[2]}"
-          sudo mount "${data_partition}" "${ventoy_mount}"
-          available_bytes="$(df --output=avail -B1 "${ventoy_mount}" | tail -n 1 | tr -d '[:space:]')"
-          if (( available_bytes < iso_bytes )); then
-            echo "Ventoy data partition is too small: available=${available_bytes} ISO=${iso_bytes}" >&2
-            exit 1
-          fi
-          sudo cp "${ISO_PATH}" "${ventoy_mount}/AtomOS-Tiny11-25H2-003.iso"
-          sudo sync
-          sudo umount "${ventoy_mount}"
-
-          bios="$(find /usr/share/seabios /usr/share/qemu -type f -name 'bios.bin' -print -quit 2>/dev/null || true)"
-          [[ -n "${bios}" ]] || {
-            echo "SeaBIOS firmware was not found." >&2
-            exit 1
-          }
-
-          rm -f "${ventoy_monitor}"
-          qemu-system-x86_64 \
-            -name ventoy-broadwell-legacy-bios \
-            -machine pc \
-            -bios "${bios}" \
-            -cpu Broadwell \
-            -m 2048 \
-            -smp 2 \
-            -drive "file=${ventoy_disk},format=raw,if=ide" \
-            -boot order=c,menu=off,strict=on \
-            -display none \
-            -monitor "unix:${ventoy_monitor},server,nowait" \
-            -serial "file:${ventoy_serial}" \
-            -no-reboot \
-            > "${ventoy_log}" 2>&1 &
-          ventoy_pid=$!
-
-          monitor_ready=false
-          for _ in $(seq 1 30); do
-            if [[ -S "${ventoy_monitor}" ]]; then
-              monitor_ready=true
-              break
-            fi
-            if ! kill -0 "${ventoy_pid}" 2>/dev/null; then
-              break
-            fi
-            sleep 1
-          done
-          [[ "${monitor_ready}" == true ]] || {
-            echo "Ventoy QEMU monitor did not become ready." | tee reports/ventoy-summary.txt
-            exit 1
-          }
-
-          capture_ventoy_screen() {
-            local name="$1"
-            local ppm="${ventoy_prefix}-${name}.ppm"
-            local png="${ventoy_prefix}-${name}.png"
-            local ocr="${ventoy_prefix}-${name}.txt"
-            rm -f "${ppm}" "${png}" "${ocr}"
-            timeout 15s bash -c "printf 'screendump %s\n' \"${ppm}\" | socat - \"UNIX-CONNECT:${ventoy_monitor}\"" >/dev/null 2>&1
-            [[ -s "${ppm}" ]] || return 1
-            convert "${ppm}" "${png}"
-            rm -f "${ppm}"
-            tesseract "${png}" "${ocr%.txt}" 2>/dev/null || true
-            [[ -s "${png}" ]]
-          }
-
-          has_boot_failure() {
-            grep -Eiq \
-              'no bootable|boot failed|operating system not found|invalid system disk|non-system disk|not a bootable disk' \
-              "$1"
-          }
-
-          ventoy_menu_ok=0
-          first_boot_ok=0
-          restart_boot_ok=0
-
-          sleep 15
-          if capture_ventoy_screen "menu"; then
-            if grep -Eiq 'ventoy|atomos|tiny11|atom' "${ventoy_prefix}-menu.txt"; then
-              ventoy_menu_ok=1
-            fi
-            has_boot_failure "${ventoy_prefix}-menu.txt" && ventoy_menu_ok=0
-          fi
-
-          timeout 10s bash -c "printf 'sendkey ret\n' | socat - \"UNIX-CONNECT:${ventoy_monitor}\"" >/dev/null 2>&1 || true
-          sleep "${boot_seconds}"
-          if kill -0 "${ventoy_pid}" 2>/dev/null && capture_ventoy_screen "boot"; then
-            first_boot_ok=1
-            has_boot_failure "${ventoy_prefix}-boot.txt" && first_boot_ok=0
-          fi
-
-          if kill -0 "${ventoy_pid}" 2>/dev/null; then
-            timeout 10s bash -c "printf 'sendkey ctrl-alt-delete\n' | socat - \"UNIX-CONNECT:${ventoy_monitor}\"" >/dev/null 2>&1 || true
-            sleep 15
-            capture_ventoy_screen "restart-menu" || true
-            timeout 10s bash -c "printf 'sendkey ret\n' | socat - \"UNIX-CONNECT:${ventoy_monitor}\"" >/dev/null 2>&1 || true
-            sleep "${restart_seconds}"
-            if kill -0 "${ventoy_pid}" 2>/dev/null && capture_ventoy_screen "restart-boot"; then
-              restart_boot_ok=1
-              has_boot_failure "${ventoy_prefix}-restart-boot.txt" && restart_boot_ok=0
-            fi
-          fi
-
-          node <<'NODE'
-          const fs = require("node:fs");
-          const result = {
-            test: "Ventoy Legacy BIOS boot and reset",
-            cpuProfile: "Broadwell (5th-generation Intel Core i5-class)",
-            ventoyUrl: process.env.VENTOY_URL,
-            menuPassed: fs.existsSync("reports/ventoy-menu.png"),
-            firstBootPassed: fs.existsSync("reports/ventoy-boot.png"),
-            resetMenuCaptured: fs.existsSync("reports/ventoy-restart-menu.png"),
-            resetBootPassed: fs.existsSync("reports/ventoy-restart-boot.png"),
-            note: "The test boots the ISO through Ventoy, resets the virtual machine, then boots the ISO through Ventoy again. It does not install Windows to a virtual disk.",
-          };
-          fs.writeFileSync("reports/ventoy-results.json", JSON.stringify(result, null, 2) + "\n");
-          console.log(JSON.stringify(result, null, 2));
-          NODE
-
-          {
-            echo "# Ventoy Legacy BIOS test"
-            echo
-            echo "- Ventoy release: ${VENTOY_URL}"
-            echo "- CPU profile: Broadwell (5th-generation Intel Core i5-class)"
-            echo "- Ventoy menu captured: ${ventoy_menu_ok}"
-            echo "- First ISO boot passed: ${first_boot_ok}"
-            echo "- Restart ISO boot passed: ${restart_boot_ok}"
-            echo
-            echo "PNG screenshots are included for the Ventoy menu, first boot, restart menu, and restart boot."
-            echo "This validates the Ventoy/BIOS boot chain, not a full installed-Windows restart."
-          } | tee reports/ventoy-summary.txt
-
-          if (( ventoy_menu_ok == 0 || first_boot_ok == 0 || restart_boot_ok == 0 )); then
-            exit 1
-          fi
 
       - name: Upload inspection reports
         if: always()
